@@ -1,0 +1,13 @@
+{
+  "name": "amit-local-mods",
+  "owner": {
+    "name": "Amit"
+  },
+  "plugins": [
+    {
+      "name": "session-progress",
+      "source": "./",
+      "description": "/progress: session progress, token use per task, past sessions, storage and memory cleanup, and fixes Claude can apply"
+    }
+  ]
+}
