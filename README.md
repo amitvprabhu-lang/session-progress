@@ -4,6 +4,9 @@ A Claude Code mod: type `/progress` to open an animated pane beside the chat tha
 
 - **Overview**: cost, tokens, requests and context fill for the current session, an efficiency score, the current plan's progress, the token mix (tokens vs. cost), context size per request, and where the spend went.
 - **What next**: whether to continue, `/compact`, start a new session, or hand work to a subagent, with the token math behind it. A short hint appears above the prompt when switching would clearly pay off.
+- **While background work runs** (background shells, subagents, monitors, scheduled wake-ups): the advice stays on this session, and the prompt cache can be kept warm with a tiny request just before it would lapse, until the work is done or the pings would cost more than re-caching.
+- **Tips as you go**: after a turn, a new or worsening issue shows above the prompt with a one-click fix, at most every third turn; optionally a one-line note goes to Claude so it adjusts by itself.
+- **Loaded but unused**: connectors loaded in the session that this session and this project's past sessions never used, with their per-request token weight and a button to have Claude switch them off (after asking).
 - **Tasks**: every prompt you sent, with its share of spend, tools, plan steps and subagents.
 - **Tips**: recommendations with evidence and estimated savings, and buttons that hand the fix to Claude or make it a rule in your `~/.claude/CLAUDE.md`.
 - **History**: past sessions across your projects, what keeps costing you, and any past session opened in full.

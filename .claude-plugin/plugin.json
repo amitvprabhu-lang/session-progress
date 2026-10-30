@@ -1,5 +1,5 @@
 {
   "name": "session-progress",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "/progress: session progress, token use per task, past sessions, storage and memory cleanup, and fixes Claude can apply"
 }

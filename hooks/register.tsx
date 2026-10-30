@@ -3,10 +3,12 @@ import type { EngineInterface, Register, RenderChildren, RenderSurface, Timer } 
 import type {
   Advice,
   HistoryCache,
+  LoadedServer,
   LoadState,
   Report,
   ReviewState,
   SessionSummary,
+  Settings,
   StepReport,
   Tab,
   TaskReport,
@@ -18,9 +20,15 @@ import {
   advise,
   insight,
   isActionText,
+  loadedServers,
+  pickTip,
   projectLabel,
+  projectTip,
   rulesForAll,
   summarize,
+  switchOffAction,
+  type Tip,
+  tipRank,
   usdOf,
 } from './advise'
 import { createReader, fmtTokens, type SubagentInput, type TranscriptReader } from './analyze'
@@ -108,7 +116,22 @@ const view = {
   draft: null as Action | null,
   notice: null as { text: string; isError: boolean; at: number } | null,
   dismissed: null as Advice['verdict'] | null,
+  /** Background work and wake-ups still pending at the last turn's end, described. */
+  background: [] as string[],
+  servers: [] as LoadedServer[],
+  tip: null as Tip | null,
+  tipShown: new Map<string, number>(),
+  tipDismissed: new Set<string>(),
+  turnsSinceTip: 99,
+  warm: { pings: 0, cost: 0, isActive: false, isIneffective: false, isCapped: false },
 }
+
+const settings: Settings = { autoTips: true, keepWarm: true, coach: false }
+/** Notes for Claude, attached once to the next prompt while coaching is on. */
+const coachNotes: string[] = []
+let warmTimer: Timer | undefined
+/** Whether the engine reports background work at a turn's end; until it does, running subagents stand in. */
+let isStopSeen = false
 
 let cache: HistoryCache | null = null
 let ticker: Timer | undefined
@@ -379,6 +402,10 @@ const refresh = async ($: $, isQuiet = false): Promise<void> => {
     })
     view.report = next
     view.lastActivity = Math.max(view.lastActivity, next.endedAt)
+    const tools = await $.tool.list().catch(() => [])
+    const folder = path.split('/').at(-2) ?? ''
+    const past = Object.values((await getCache($)).sessions).filter(x => x.path.includes(`/${folder}/`))
+    view.servers = loadedServers(tools, next.serversUsed, past)
     view.load = { status: 'ready' }
     // What a dollar buys on this model, so past sessions can be priced.
     if (usage.usd !== null && next.model && next.weighted > 10_000) {
@@ -959,6 +986,103 @@ const reveal = async ($: $, path: string): Promise<void> => {
   await run($, ['open', '-R', path])
 }
 
+// ---------------------------------------------------------------- doing things on its own
+
+const saveSettings = async ($: $): Promise<void> => {
+  const c = await getCache($)
+  c.settings = { ...settings }
+  await saveCache($)
+}
+
+const writeWeightOf = (r: Report | null): number => (r && r.tokens.cacheWrite1h > 0 ? 2 : 1.25)
+const ttlOf = (r: Report | null): number => (r && r.tokens.cacheWrite1h > 0 ? 3_600_000 : 300_000)
+
+/**
+ * While background work runs, the session waits for it with nobody typing,
+ * and the prompt cache would lapse: one tiny request over the conversation,
+ * just before it does, reads it from the cache and keeps it there. It stops
+ * once the pings would cost more than half of writing the cache again.
+ */
+const scheduleWarm = async ($: $): Promise<void> => {
+  warmTimer?.cancel()
+  warmTimer = undefined
+  const isWanted = settings.keepWarm && !view.warm.isIneffective && !view.isTurnRunning && view.background.length > 0
+  view.warm.isActive = isWanted && !view.warm.isCapped
+  if (!view.warm.isActive) return
+  const ttl = ttlOf(view.report)
+  const lead = ttl > 300_000 ? 5 * 60_000 : 45_000
+  const due = Math.max(15_000, view.lastActivity + ttl - lead - (await $.clock.now()))
+  warmTimer = $.clock.after(due, () => void pingWarm($))
+}
+
+const pingWarm = async ($: $): Promise<void> => {
+  if (!settings.keepWarm || view.isTurnRunning || view.background.length === 0) return
+  const weight = writeWeightOf(view.report)
+  const cap = Math.floor((0.5 * weight) / 0.1)
+  if (view.warm.pings >= cap) {
+    view.warm.isCapped = true
+    view.warm.isActive = false
+    notify($, 'Stopped keeping the cache warm: more pings would cost more than writing it again once.')
+
+    return
+  }
+  const context = view.usage?.tokens ?? view.report?.timeline.at(-1)?.tokens ?? 0
+  const result = await $.model.fork({ prompt: 'Reply with the single word OK.' })
+  if (!result.isAnswered && result.reason === 'nothing-to-fork') return
+  const u = result.usage
+  view.warm.pings += 1
+  view.warm.cost += u.input_tokens + u.cache_creation_input_tokens * weight + u.cache_read_input_tokens * 0.1 + u.output_tokens * 5
+  if (u.cache_read_input_tokens < context * 0.5) {
+    // The ping did not reuse the conversation's cache here, so it cannot keep it warm.
+    view.warm.isIneffective = true
+    view.warm.isActive = false
+    await logFailure($, 'keep warm', `read ${u.cache_read_input_tokens} of ${context} from cache`)
+    notify($, 'Keeping the cache warm does not work in this session, so it is off.', true)
+
+    return
+  }
+  view.lastActivity = await $.clock.now()
+  redraw($)
+  await scheduleWarm($)
+}
+
+/** After a turn: one new or worse issue, offered above the prompt, at most every third turn. */
+const considerTip = ($: $): void => {
+  const r = view.report
+  if (!r || !settings.autoTips) return
+  view.turnsSinceTip += 1
+  if (view.turnsSinceTip < 3 && view.tip) return
+  const unused = view.servers.filter(x => !x.isUsedHere && x.isUsedInProject !== true)
+  const unusedTokens = unused.reduce((n, x) => n + x.tokens, 0)
+  const serversTip: Tip | null =
+    unusedTokens >= 3000 && !view.tipDismissed.has('unused-servers') && !view.tipShown.has('unused-servers')
+      ? {
+          id: 'unused-servers',
+          title: `${unused.length} connector${unused.length === 1 ? '' : 's'} loaded but unused`,
+          detail: `~${fmtTokens(unusedTokens)} tokens of tool listings ride on every request: ${unused.slice(0, 3).map(x => x.label).join(', ')}${unused.length > 3 ? '…' : ''}`,
+          actions: [switchOffAction(unused)!],
+        }
+      : null
+  const folder = view.transcriptPath?.split('/').at(-2) ?? ''
+  const past = Object.values(cache?.sessions ?? {}).filter(x => x.path.includes(`/${folder}/`))
+  const tip =
+    pickTip(r.recommendations, view.tipShown, view.tipDismissed) ??
+    serversTip ??
+    (view.tipShown.size === 0 ? projectTip(past, view.tipDismissed) : null)
+  if (!tip) return
+  const rec = r.recommendations.find(x => x.id === tip.id)
+  view.tipShown.set(tip.id, rec ? tipRank(rec.severity) : 9)
+  view.tip = tip
+  view.turnsSinceTip = 0
+  if (settings.coach && rec) coachNotes.push(`${rec.title}. ${rec.action}`)
+  try {
+    $.ui.toast(`Tip: ${tip.title}`)
+  } catch {
+    // The hint above the prompt shows it too.
+  }
+  redraw($)
+}
+
 // ---------------------------------------------------------------- Claude's own review
 
 const summarizeForReview = (r: Report): string => {
@@ -1026,6 +1150,7 @@ const currentAdvice = (now: number): Advice | null => {
     isPlanDone: plan ? plan.steps.every(s => s.status === 'completed') : null,
     averageReadTokens: r?.averageReadTokens ?? 0,
     usdPerWeighted: rate,
+    background: view.background,
   })
 }
 
@@ -1078,6 +1203,7 @@ export const register: Register = on => {
       description: 'Session progress, token use, past sessions, storage and memory, with fixes Claude can apply',
       immediate: true,
     })
+    Object.assign(settings, (await getCache($)).settings ?? {})
     // Re-checks the cache window once a minute, so the hint above the prompt keeps up.
     $.clock.every(60_000, () => {
       if (!view.isTurnRunning && view.lastActivity > 0) redraw($)
@@ -1105,6 +1231,7 @@ export const register: Register = on => {
       return result
     }
     if (waiting > 0) expected.set(e.text, waiting - 1)
+    warmTimer?.cancel()
     view.isTurnRunning = true
     view.dismissed = null
     redraw($)
@@ -1120,13 +1247,20 @@ export const register: Register = on => {
       live = undefined
       view.isTurnRunning = false
       view.lastActivity = await $.clock.now()
+      if (!isStopSeen) {
+        const agents = await $.agent.list().catch(() => [])
+        view.background = agents
+          .filter(a => a.status === 'running' || a.status === 'pending')
+          .map(a => `subagent: ${(a.description || a.name || a.id).slice(0, 80)}`)
+        await scheduleWarm($)
+      }
       const held = view.held
       if (held) {
         view.held = null
         $.clock.after(800, () => void sendPrompt($, held, 'desktop'))
       }
       const isStale = !view.report || view.lastActivity - view.report.generatedAt > 5 * 60_000
-      if (isPaneOpen || isStale) $.clock.after(1500, () => void refresh($, true))
+      if (isPaneOpen || isStale || settings.autoTips) $.clock.after(1500, () => void refresh($, true).then(() => considerTip($)))
       else {
         const usage = await $.session.usage()
         view.usage = { tokens: usage.context.tokens ?? null, window: usage.context.window, percent: usage.context.percent ?? null }
@@ -1135,6 +1269,30 @@ export const register: Register = on => {
     }
 
     return result
+  })
+
+  // The end of a main turn: what background work and wake-ups are still pending.
+  on('classic.Stop', async ($, e, next) => {
+    isStopSeen = true
+    const tasks = (e.background_tasks ?? []).filter(t => t.status === 'running' || t.status === 'pending')
+    const wakeups = e.session_crons ?? []
+    view.background = [
+      ...tasks.map(t => `${t.type}: ${(t.description || t.command || t.id).slice(0, 80)}`),
+      ...wakeups.map(c => `scheduled wake-up: ${c.prompt.slice(0, 60)}`),
+    ]
+    view.lastActivity = await $.clock.now()
+    await scheduleWarm($)
+    redraw($)
+
+    return next(e)
+  })
+
+  // Coaching: a one-line note for Claude, attached once to the next prompt.
+  on('prompt.submit', async ($, e, next) => {
+    if (!settings.coach || coachNotes.length === 0 || e.command || e.isMeta) return next(e)
+    const notes = coachNotes.splice(0).map(n => `Token-efficiency note from the session-progress mod: ${n}`)
+
+    return next({ ...e, context: [...(e.context ?? []), ...notes] })
   })
 
   on('ui.close', async ($, e, next) => {
@@ -1151,8 +1309,38 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || view.isTurnRunning) return next(e)
     const advice = currentAdvice(await $.clock.now())
-    if (!advice?.isUrgent || view.dismissed === advice.verdict) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
+    if (!advice?.isUrgent || view.dismissed === advice.verdict) {
+      const tip = settings.autoTips ? view.tip : null
+      if (!tip) return next(e)
+
+      return (
+        <Box flexDirection="row" gap={1} alignItems="center" flexWrap="wrap">
+          <Text color={SERIES.fresh.light}>◆ Tip</Text>
+          <Text>{tip.title}</Text>
+          <Text dimColor>{tip.detail}</Text>
+          {tip.actions.slice(0, 2).map((a, i) => (
+            <Button
+              key={`band-tip-${a.key}`}
+              label={view.sent.has(a.key) ? `✓ ${a.label}` : a.label}
+              variant={i === 0 ? 'primary' : 'secondary'}
+              onPress={() => later($, () => runAction($, a, e.surface))}
+            />
+          ))}
+          <Button key="band-tip-more" label="Details" onPress={() => later($, () => openPane($, 'tips'))} />
+          <Button
+            key="band-tip-dismiss"
+            label="Not now"
+            dimColor
+            onPress={() => {
+              view.tipDismissed.add(tip.id)
+              view.tip = null
+              redraw($)
+            }}
+          />
+        </Box>
+      )
+    }
     const action = adviceActions(advice.verdict)[0]
 
     return (
@@ -1409,6 +1597,17 @@ export const register: Register = on => {
           {advice.reasons.map((line, i) => (
             <Text key={`why-${i}`} dimColor>{`• ${line}`}</Text>
           ))}
+          {view.background.length > 0 ? (
+            <Text color={view.warm.isActive ? STATUS.good : undefined} dimColor={!view.warm.isActive}>
+              {view.warm.isIneffective
+                ? '• Keeping the cache warm does not work in this session.'
+                : view.warm.isActive
+                  ? `• Keeping the cache warm until they finish${view.warm.pings > 0 ? `: ${view.warm.pings} ping${view.warm.pings === 1 ? '' : 's'}, ${costOf(r ?? view.report!, view.warm.cost)} so far` : ''}.`
+                  : view.warm.isCapped
+                    ? '• Stopped keeping the cache warm: more pings would cost more than writing it again.'
+                    : '• Keeping the cache warm is off (Automation, below).'}
+            </Text>
+          ) : null}
           {actionRow(adviceActions(advice.verdict), 'advice')}
           {advice.options.map(o => (
             <Box key={`opt-${o.id}`} flexDirection="column" marginTop={1}>
@@ -1436,8 +1635,59 @@ export const register: Register = on => {
       const weightedParts = mixParts(rep.tokens, true)
       const countParts = mixParts(rep.tokens, false)
 
+      const unused = view.servers.filter(x => !x.isUsedHere && x.isUsedInProject !== true)
+      const unusedTokens = unused.reduce((n, x) => n + x.tokens, 0)
+      const offAction = switchOffAction(unused)
+      const toggle = (key: keyof Settings, label: string, detail: string) => (
+        <Box key={`set-${key}`} flexDirection="row" justifyContent="space-between" gap={1} alignItems="center">
+          <Box flexDirection="column" flexShrink={1}>
+            <Text>{label}</Text>
+            <Text dimColor>{detail}</Text>
+          </Box>
+          <Button
+            key={`toggle-${key}`}
+            label={settings[key] ? 'On' : 'Off'}
+            variant={settings[key] ? 'primary' : 'secondary'}
+            onPress={() => {
+              settings[key] = !settings[key]
+              if (key === 'autoTips' && !settings.autoTips) view.tip = null
+              later($, async () => {
+                await saveSettings($)
+                if (key === 'keepWarm') await scheduleWarm($)
+                redraw($)
+              })
+            }}
+          />
+        </Box>
+      )
+
       return [
         isPast ? null : adviceCard(),
+
+        !isPast && unused.length > 0
+          ? section(
+              'Loaded but unused',
+              <Text dimColor>
+                {`${unused.length} connector${unused.length === 1 ? '' : 's'} not used in this session${unused.some(x => x.isUsedInProject === false) ? ' or in this project’s known sessions' : ''}: their tool listings add ~${fmtTokens(unusedTokens)} tokens to every request. A connector switched off stays off for new sessions until you turn it back on (+ menu → Connectors).`}
+              </Text>,
+              ...unused.slice(0, 8).map(x => (
+                <Box key={`srv-${x.key}`} flexDirection="row" justifyContent="space-between" gap={1}>
+                  <Text wrap="truncate-end">{x.label}</Text>
+                  <Text dimColor>{`${x.tools} tools · ~${fmtTokens(x.tokens)}${x.isUsedInProject === false ? ' · unused in this project' : ''}`}</Text>
+                </Box>
+              )),
+              offAction ? actionRow([offAction], 'servers') : null,
+            )
+          : null,
+
+        isPast
+          ? null
+          : section(
+              'Automation',
+              toggle('autoTips', 'Tips as you go', 'After a turn, a new or worsening issue shows above the prompt, at most every third turn.'),
+              toggle('keepWarm', 'Keep the cache warm during background work', 'A tiny request just before the cache would lapse, while background tasks run; stops when it stops paying.'),
+              toggle('coach', 'Coach Claude', 'With a new tip, a one-line note goes to Claude with your next prompt, so it adjusts by itself.'),
+            ),
 
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {tile(

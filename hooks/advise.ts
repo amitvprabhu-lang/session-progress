@@ -1,4 +1,5 @@
 import type {
+  LoadedServer,
   Advice,
   AdviceOption,
   HistoryInsight,
@@ -148,6 +149,8 @@ export type AdviceInput = {
   /** Tokens an average read-type tool result added to context. */
   averageReadTokens: number
   usdPerWeighted: number | null
+  /** Background work still running (shells, subagents, monitors, workflows) and wake-ups scheduled. */
+  background: string[]
 }
 
 const money = (weighted: number, rate: number | null): string =>
@@ -201,6 +204,21 @@ export const advise = (a: AdviceInput): Advice => {
   ]
 
   const reasons: string[] = []
+  // Background work reports back into this session: leaving it now would strand the results.
+  if (a.background.length > 0) {
+    const n = a.background.length
+    for (const o of options) {
+      if (o.id === 'new-session' || o.id === 'compact') o.detail = `Wait until the background work is done. ${o.detail}`
+    }
+
+    return {
+      verdict: 'continue',
+      headline: `${n} background task${n === 1 ? '' : 's'} still running: stay in this session; the results come back here.`,
+      reasons: a.background.slice(0, 4).map(b => `Running: ${b}`),
+      options,
+      isUrgent: false,
+    }
+  }
   let verdict: Advice['verdict'] = 'continue'
   let headline = 'Keep going here: context is small and the cache is warm.'
   let isUrgent = false
@@ -293,6 +311,8 @@ export const summarize = (
   model: r.model,
   score: r.score,
   issues: r.recommendations.map(x => ({ id: x.id, saving: x.saving })),
+  serversUsed: r.serversUsed,
+  skillsUsed: r.skillsUsed,
   size: file.size,
   mtimeMs: file.mtimeMs,
 })
@@ -352,4 +372,116 @@ export const isActionText = (text: string): boolean =>
   text === SUBAGENT_TEXT ||
   Object.values(SESSION_PROMPTS).some(p => p.text === text) ||
   Object.keys(RULES).some(id => ruleAction(id)?.text === text) ||
-  text.startsWith('Add these rules to a "Token efficiency" section of my user-level ~/.claude/CLAUDE.md')
+  text.startsWith('Add these rules to a "Token efficiency" section of my user-level ~/.claude/CLAUDE.md') ||
+  text.startsWith('These MCP servers are loaded but were not used')
+
+// ---------------------------------------------------------------- tips as you go
+
+/** A recommendation offered above the prompt while the session runs. */
+export type Tip = {
+  id: string
+  title: string
+  detail: string
+  actions: Action[]
+}
+
+const RANK = { low: 1, medium: 2, high: 3 } as const
+
+/**
+ * The tip worth showing now: the largest saving not dismissed, that is new
+ * or has grown more severe since it was last shown.
+ */
+export const pickTip = (
+  recs: readonly { id: string; title: string; evidence: string[]; action: string; severity: keyof typeof RANK; saving: number }[],
+  shown: ReadonlyMap<string, number>,
+  dismissed: ReadonlySet<string>,
+): Tip | null => {
+  const fresh = recs
+    .filter(r => !dismissed.has(r.id) && r.severity !== 'low' && RANK[r.severity] > (shown.get(r.id) ?? 0))
+    .sort((a, b) => b.saving - a.saving)[0]
+
+  return fresh
+    ? { id: fresh.id, title: fresh.title, detail: fresh.evidence[0] ?? fresh.action, actions: actionsFor(fresh.id) }
+    : null
+}
+
+export const tipRank = (severity: keyof typeof RANK): number => RANK[severity]
+
+/** What keeps happening in this project's past sessions, offered once as a rule. */
+export const projectTip = (sessions: SessionSummary[], dismissed: ReadonlySet<string>): Tip | null => {
+  if (sessions.length < 3) return null
+  const top = insight(sessions, {}).recurring.find(
+    r => r.sessions / sessions.length >= 0.5 && !dismissed.has(`project-${r.id}`) && ruleAction(r.id),
+  )
+
+  return top
+    ? {
+        id: `project-${top.id}`,
+        title: `In this project: ${top.label.toLowerCase()} (${top.sessions} of ${sessions.length} past sessions)`,
+        detail: top.action,
+        actions: [ruleAction(top.id)!],
+      }
+    : null
+}
+
+// ---------------------------------------------------------------- what is loaded but unused
+
+/** Servers built into the app: always loaded, not something to switch off. */
+const BUILT_IN = /^(ccd_|plugin-authoring$|session-progress$|Claude_Browser$|Claude_Code_iOS_Simulator$|visualize$|terminal$|scheduled-tasks$|mcp-registry$)/
+
+/**
+ * Groups the loaded MCP tools by server, names each by its tools' common
+ * prefix (a connector's key is an id), and marks what this session and this
+ * project's past sessions used.
+ */
+export const loadedServers = (
+  tools: readonly { name: string; description: string; mcp: boolean }[],
+  usedHere: readonly string[],
+  past: readonly SessionSummary[],
+): LoadedServer[] => {
+  const byKey = new Map<string, { names: string[]; chars: number }>()
+  for (const t of tools) {
+    if (!t.mcp || !t.name.startsWith('mcp__')) continue
+    const key = t.name.split('__')[1] ?? ''
+    if (!key || BUILT_IN.test(key)) continue
+    const now = byKey.get(key) ?? { names: [], chars: 0 }
+    now.names.push(t.name.split('__').slice(2).join('__'))
+    now.chars += t.name.length + 12
+    byKey.set(key, now)
+  }
+  const known = past.filter(p => p.serversUsed !== undefined)
+
+  return [...byKey.entries()]
+    .map(([key, v]) => {
+      const prefixes = new Map<string, number>()
+      for (const n of v.names) {
+        const prefix = /^([A-Za-z]+)_/.exec(n)?.[1]
+        if (prefix) prefixes.set(prefix, (prefixes.get(prefix) ?? 0) + 1)
+      }
+      const top = [...prefixes.entries()].sort((a, b) => b[1] - a[1])[0]
+      const isId = /^[0-9a-f]{8}-/.test(key)
+      const label = top && top[1] >= v.names.length / 2 ? top[0] : isId ? `Connector ${key.slice(0, 8)}` : key.replace(/_/g, ' ')
+
+      return {
+        key,
+        label,
+        tools: v.names.length,
+        tokens: Math.round(v.chars / 3.2),
+        isUsedHere: usedHere.includes(key),
+        isUsedInProject: known.length === 0 ? null : known.some(p => p.serversUsed!.includes(key)),
+      }
+    })
+    .sort((a, b) => b.tokens - a.tokens)
+}
+
+/** The prompt that hands switching them off to Claude, which asks before changing anything. */
+export const switchOffAction = (servers: readonly LoadedServer[]): Action | null =>
+  servers.length === 0
+    ? null
+    : {
+        key: 'switch-off-unused',
+        label: `Turn off ${servers.length} unused`,
+        kind: 'prompt',
+        scope: 'session',
+        text: `These MCP servers are loaded but were not used in this session${servers.some(s => s.isUsedInProject === false) ? ' or in this project’s recent sessions' : ''}: ${servers.map(s => `${s.label} (${s.tools} tools)`).join(', ')}. Check the list, then offer to turn them off for this session: connectors with the connectors tool, and for desktop extensions or MCP servers in my settings tell me where to switch them off. Say that a connector switched off here also stays off for new sessions until I turn it back on. Change nothing until I confirm.`,
+      }

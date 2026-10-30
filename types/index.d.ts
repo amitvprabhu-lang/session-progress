@@ -87,6 +87,10 @@ export type Report = {
   context: { tokens: number | null; window: number; percent: number | null }
   /** Tokens an average read, search or fetch result added to context. */
   averageReadTokens: number
+  /** MCP servers whose tools were called, by the key in their tool names. */
+  serversUsed: string[]
+  /** Skills invoked (`plugin:skill` for a plugin's). */
+  skillsUsed: string[]
   baseline: number
   baselineSlices: ContextSlice[]
   cacheHitRate: number
@@ -128,6 +132,9 @@ export type SessionSummary = {
   model: string
   score: number
   issues: { id: string; saving: number }[]
+  /** Absent in summaries made before the mod recorded them. */
+  serversUsed?: string[]
+  skillsUsed?: string[]
   size: number
   mtimeMs: number
 }
@@ -139,6 +146,29 @@ export type HistoryCache = {
   rates: Record<string, number>
   /** The directory each project folder's sessions ran in. */
   cwds?: Record<string, string>
+  settings?: Partial<Settings>
+}
+
+/** What the mod does on its own, switched from the pane. */
+export type Settings = {
+  /** A tip above the prompt when a new issue shows up. */
+  autoTips: boolean
+  /** While background work runs, a tiny request before the cache would expire. */
+  keepWarm: boolean
+  /** A one-line note to Claude with the next prompt when a new issue shows up. */
+  coach: boolean
+}
+
+/** A loaded MCP server and whether it earned its place. */
+export type LoadedServer = {
+  key: string
+  label: string
+  tools: number
+  /** Rough tokens its tool names and descriptions add to every request. */
+  tokens: number
+  isUsedHere: boolean
+  /** Used in any of this project's known past sessions; null when none are known. */
+  isUsedInProject: boolean | null
 }
 
 export type RecurringIssue = {

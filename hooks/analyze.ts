@@ -345,6 +345,10 @@ type Pass = {
   compactedSince: boolean
   compactions: number
   editedFiles: Set<string>
+  /** MCP servers whose tools were called, by the key in their tool names. */
+  serversUsed: Set<string>
+  /** Skills invoked, as the Skill tool names them (`plugin:skill`). */
+  skillsUsed: Set<string>
 }
 
 const createPass = (): Pass => ({
@@ -361,6 +365,8 @@ const createPass = (): Pass => ({
   compactedSince: false,
   compactions: 0,
   editedFiles: new Set(),
+  serversUsed: new Set(),
+  skillsUsed: new Set(),
 })
 
 const newTask = (s: Pass, name: string, ts: number, words = new Set<string>()): void => {
@@ -465,6 +471,8 @@ const feedRow = (s: Pass, line: string): void => {
     request.tools.push(use)
     s.pendingUses.set(use.id, { use, request: s.requests.length - 1, input })
     if (EDIT_TOOLS.has(name) && typeof input.file_path === 'string') s.editedFiles.add(input.file_path)
+    if (name.startsWith('mcp__')) s.serversUsed.add(name.split('__')[1] ?? '')
+    if (name === 'Skill' && typeof input.skill === 'string') s.skillsUsed.add(input.skill)
     const before = s.plan
     s.plan = applyPlanTool(s.plan, name, input)
     if (s.plan !== before) task.plan = s.plan
@@ -514,7 +522,7 @@ export const analyze = (main: string, subagents: SubagentInput[], ctx: AnalyzeCo
 }
 
 const reportOf = (pass: Pass, subagents: SubagentInput[], ctx: AnalyzeContext): Report => {
-  const { requests, results, readPaths, toolUseTask, tasks, title, cwd, compactions, editedFiles } = pass
+  const { requests, results, readPaths, toolUseTask, tasks, title, cwd, compactions, editedFiles, serversUsed, skillsUsed } = pass
   // What follows derives from the pass without changing it, so it can run again after more is fed.
   for (const task of tasks) {
     task.stepUse = new Map()
@@ -710,6 +718,8 @@ const reportOf = (pass: Pass, subagents: SubagentInput[], ctx: AnalyzeContext): 
     usd: ctx.usd,
     context,
     averageReadTokens,
+    serversUsed: [...serversUsed].filter(Boolean),
+    skillsUsed: [...skillsUsed],
     baseline,
     baselineSlices: ctx.slices,
     cacheHitRate,

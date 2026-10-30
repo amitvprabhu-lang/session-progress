@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { actionsFor, advise, insight, ruleAction, summarize } from './advise'
+import { actionsFor, advise, insight, loadedServers, ruleAction, summarize } from './advise'
 import { analyze } from './analyze'
 import { heavyApps, isSafeToTrash, owningCli, parseElapsed, parseMemory, parsePs, sessionProcs } from './storage'
 
@@ -89,6 +89,7 @@ const ADVICE = {
   isPlanDone: null,
   averageReadTokens: 2_000,
   usdPerWeighted: null,
+  background: [] as string[],
 }
 
 test('the advisor weighs the cache window and the context fill', () => {
@@ -357,5 +358,82 @@ test('the storage tab lists old logs and moves one to the Trash only after a con
   expect(moves.length).toBe(1)
   expect(moves[0]![2]).toBe(OLD_LOG)
   expect(moves[0]![3]).toMatch(/^\/Users\/u\/\.Trash\//)
+  await ui.unmount()
+})
+
+test('background work keeps the advice on this session, and loaded connectors are named and weighed', () => {
+  const cold = advise({ ...ADVICE, now: 3 * 3_600_000, lastActivity: 1, contextTokens: 150_000, baseline: 100_000, window: 1_000_000, background: ['shell: npm test'] })
+  expect(cold.verdict).toBe('continue')
+  expect(cold.isUrgent).toBe(false)
+  expect(cold.headline).toMatch(/1 background task still running/)
+
+  const tools = [
+    { name: 'mcp__00000000-0000-4000-8000-000000000001__TaskTracker_get_tasks', description: '', mcp: true },
+    { name: 'mcp__00000000-0000-4000-8000-000000000001__TaskTracker_add_task', description: '', mcp: true },
+    { name: 'mcp__ccd_turn__wrap_up', description: '', mcp: true },
+    { name: 'mcp__playwright__browser_click', description: '', mcp: true },
+    { name: 'Bash', description: '', mcp: false },
+  ]
+  const servers = loadedServers(tools, ['playwright'], [])
+  expect(servers.map(x => [x.label, x.tools, x.isUsedHere, x.isUsedInProject])).toEqual([
+    ['TaskTracker', 2, false, null],
+    ['browser', 1, true, null],
+  ])
+})
+
+test('while background work runs the cache is kept warm, and a coached tip reaches Claude with the next prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 30, 9, 6) })
+  const forks: string[] = []
+  const contexts: string[][] = []
+  mock.env(on, { HOME: '/Users/u', USER: 'u' })
+  on('command.register', () => ({ value: { command: 'progress' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 's1' }))
+  on('session.root', () => ({ value: '/work' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { tokens: 60_000, window: 200_000, percent: 30 }, rateLimits: [], cost: { usd: 2 } } }))
+  on('fs.exists', (_, e) => ({ value: e.path === LOG_PATH }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: LOG.length, mtimeMs: 0, isLink: false } }))
+  on('fs.read', (_, e) => ({ value: e.path === LOG_PATH ? LOG : '' }))
+  on('fs.write', () => ({ value: undefined }))
+  on('tool.list', () => ({ value: [] }))
+  let agents: object[] = []
+  on('agent.list', () => ({ value: agents as never }))
+  on('model.fork', (_, e) => {
+    forks.push(e.prompt)
+
+    return { value: { isAnswered: true, text: 'OK', usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 60_000, cache_creation_input_tokens: 0 } } }
+  })
+  on('prompt.submit', (_, e) => {
+    contexts.push([...(e.context ?? [])])
+
+    return { text: e.text }
+  })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'progress', args: '' } as never)
+  await clock.advance(5_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'toggle-coach' })
+  await clock.advance(100)
+
+  // A turn ends with a background subagent still running: the cache is kept warm before it lapses.
+  agents = [{ id: 'a1', description: 'Explore the repo', type: 'Explore', status: 'running' }]
+  await $.turn.start({ text: 'Explore the repo in the background', turnId: 't1' } as never)
+  await $.turn.complete({ turnId: 't1', answer: 'started', reason: 'answer', durationMs: 1, isAborted: false } as never)
+  await clock.advance(3_000)
+  expect(forks.length).toBe(0)
+  await clock.advance(56 * 60_000)
+  expect(forks.length).toBe(1)
+
+  // The tip found after that turn goes to Claude, once, with the next prompt.
+  await $.prompt.submit({ text: 'What next?' } as never)
+  expect(contexts.at(-1)?.join(' ')).toMatch(/Token-efficiency note from the session-progress mod/)
+  await $.prompt.submit({ text: 'And then?' } as never)
+  expect(contexts.at(-1)?.join(' ') ?? '').not.toMatch(/Token-efficiency note/)
   await ui.unmount()
 })
